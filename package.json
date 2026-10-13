@@ -1,0 +1,27 @@
+{
+  "name": "pedidos360-worker",
+  "version": "1.0.0",
+  "description": "Microservicio consumidor de Pedidos360: procesa eventos de RabbitMQ (notificaciones, tickets) con ACK manual, reintentos con backoff y DLQ",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.20.0",
+      "onFail": "download"
+    }
+  },
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.3",
+    "amqplib": "^0.10.9",
+    "dotenv": "^17.4.2",
+    "express": "^5.3.0"
+  }
+}
