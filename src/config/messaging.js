@@ -132,7 +132,9 @@ export const RETRY_QUEUES = RETRY_POLICY.delaysMs.map((delayMs) => ({
   },
 }));
 
+// Reconexión sin límite: espera 3s, 6s, 12s, 24s y luego 30s entre intentos.
 export const CONNECTION = {
-  maxRetries: 10,
   retryDelayMs: 3000,
+  maxRetryDelayMs: 30000,
+  heartbeatSeconds: 30,
 };
