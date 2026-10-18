@@ -1,21 +1,24 @@
-import { EXCHANGES, HEADERS, QUEUES, RETRY_QUEUES } from "../config/messaging.js";
+import { EXCHANGES, HEADERS, RETRY_QUEUES, WORK_QUEUES } from "../config/messaging.js";
 
 // Declaración de exchanges, colas y bindings (equivalente a los @Bean Queue,
 // Exchange y Binding de Spring). Todas las operaciones son idempotentes: si
 // ya existen con los mismos argumentos, RabbitMQ no hace nada.
 
 async function declareExchanges(ch) {
-  // El DLX va primero: es el alternate-exchange de pedidos.events.
-  for (const exchange of [EXCHANGES.DLX, EXCHANGES.EVENTS, EXCHANGES.RETRY, EXCHANGES.RETRY_RETURN]) {
+  for (const exchange of Object.values(EXCHANGES)) {
     await ch.assertExchange(exchange.name, exchange.type, exchange.options);
   }
 }
 
-// Caso de uso 1 y 2: notificaciones y tickets (colas de trabajo).
+// Casos de uso 1-3: notificaciones, tickets y auditoría. Cada cola de trabajo
+// se declara junto a su DLQ propia.
 async function declareWorkQueues(ch) {
-  for (const queue of [QUEUES.NOTIFICACIONES, QUEUES.TICKETS]) {
-    await ch.assertQueue(queue.name, queue.options);
+  for (const queue of WORK_QUEUES) {
+    // DLQ de esta cola: pedidos.dlx (direct) --routingKey--> DLQ
+    await ch.assertQueue(queue.dlq.name, queue.dlq.options);
+    await ch.bindQueue(queue.dlq.name, EXCHANGES.DLX.name, queue.dlq.routingKey);
 
+    await ch.assertQueue(queue.name, queue.options);
     for (const routingKey of queue.bindings) {
       await ch.bindQueue(queue.name, EXCHANGES.EVENTS.name, routingKey);
     }
@@ -29,7 +32,7 @@ async function declareWorkQueues(ch) {
   }
 }
 
-// Caso de uso 3: reintentos con backoff (una cola de espera por nivel).
+// Caso de uso 4: reintentos con backoff (una cola de espera por nivel).
 async function declareRetryQueues(ch) {
   for (const queue of RETRY_QUEUES) {
     await ch.assertQueue(queue.name, queue.options);
@@ -37,20 +40,16 @@ async function declareRetryQueues(ch) {
   }
 }
 
-// Caso de uso 4: mensajes muertos (DLX fanout -> DLQ).
-async function declareDeadLetter(ch) {
-  await ch.assertQueue(QUEUES.DLQ.name, QUEUES.DLQ.options);
-  await ch.bindQueue(QUEUES.DLQ.name, EXCHANGES.DLX.name, "");
-}
-
 export async function declareTopology(ch) {
   await declareExchanges(ch);
-  await declareDeadLetter(ch);
   await declareRetryQueues(ch);
   await declareWorkQueues(ch);
   console.log("[RABBITMQ] Topología declarada:");
-  console.log(`  ${EXCHANGES.EVENTS.name} -> ${QUEUES.NOTIFICACIONES.name} [${QUEUES.NOTIFICACIONES.bindings.join(", ")}]`);
-  console.log(`  ${EXCHANGES.EVENTS.name} -> ${QUEUES.TICKETS.name} [${QUEUES.TICKETS.bindings.join(", ")}]`);
+  for (const queue of WORK_QUEUES) {
+    console.log(
+      `  ${EXCHANGES.EVENTS.name} [${queue.bindings.join(", ")}] -> ${queue.name}` +
+        `  | DLQ: ${EXCHANGES.DLX.name} [${queue.dlq.routingKey}] -> ${queue.dlq.name}`,
+    );
+  }
   console.log(`  ${EXCHANGES.RETRY.name} -> ${RETRY_QUEUES.map((q) => q.name).join(", ")}`);
-  console.log(`  ${EXCHANGES.DLX.name} -> ${QUEUES.DLQ.name}`);
 }

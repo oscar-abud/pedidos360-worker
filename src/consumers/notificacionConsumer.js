@@ -5,7 +5,7 @@ import * as NotificacionService from "../services/notificacionService.js";
 // Dominio: NOTIFICACIONES. Escucha pedidos.notificaciones.queue
 // (pedido.creado, pedido.estado.*, usuario.creado) y avisa al destinatario.
 export function registerNotificacionConsumer(channel) {
-  return registerListener(channel, QUEUES.NOTIFICACIONES.name, async (evento) => {
+  return registerListener(channel, QUEUES.NOTIFICACIONES, async (evento) => {
     NotificacionService.notificar(evento);
   });
 }

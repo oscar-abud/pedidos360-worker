@@ -6,7 +6,7 @@ import { aplicarFalloSimulado } from "./simulacion.js";
 // Dominio: TICKETS. Escucha pedidos.tickets.queue (pedido.creado) y genera
 // el comprobante del pedido.
 export function registerTicketConsumer(channel) {
-  return registerListener(channel, QUEUES.TICKETS.name, async (evento, msg) => {
+  return registerListener(channel, QUEUES.TICKETS, async (evento, msg) => {
     aplicarFalloSimulado(msg);
     const ticket = await TicketService.generarTicket(evento.data);
     console.log(`[TICKET] ${ticket.numero} generado para el pedido ${ticket.pedido_id}`);

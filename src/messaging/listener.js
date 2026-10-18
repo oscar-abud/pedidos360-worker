@@ -9,9 +9,10 @@ import { NonRetryableError } from "./errors.js";
 //   2. Error recuperable, quedan intentos -> se publica en la cola de espera
 //      (backoff 1s/2s/4s) con x-retry-count+1 y luego ACK del original
 //   3. Error recuperable, sin intentos    -> NACK(requeue=false): RabbitMQ lo
-//      envía al DLX por la configuración de la cola (x-dead-letter-exchange)
+//      envía al DLX por la configuración de la cola (x-dead-letter-exchange +
+//      x-dead-letter-routing-key) y termina en la DLQ de ESA cola
 //   4. Error no recuperable               -> se publica directo en el DLX con
-//      el motivo y luego ACK (no tiene sentido reintentar)
+//      la routing key de la DLQ de la cola y el motivo, y luego ACK
 //
 // Nunca se usa requeue=true: evita bucles infinitos de reprocesamiento.
 
@@ -39,7 +40,9 @@ function parseEvent(msg) {
   }
 }
 
-export async function registerListener(channel, queueName, handler) {
+// queue: entrada de QUEUES en config/messaging.js ({ name, dlq: { routingKey } }).
+export async function registerListener(channel, queue, handler) {
+  const queueName = queue.name;
   await channel.consume(
     queueName,
     async (msg) => {
@@ -58,13 +61,13 @@ export async function registerListener(channel, queueName, handler) {
         try {
           if (error instanceof NonRetryableError) {
             // (4)
-            await publishConfirmed(channel, EXCHANGES.DLX.name, "", msg, {
+            await publishConfirmed(channel, EXCHANGES.DLX.name, queue.dlq.routingKey, msg, {
               [HEADERS.ORIGINAL_QUEUE]: queueName,
               [HEADERS.DEAD_REASON]: "no-recuperable",
               [HEADERS.LAST_ERROR]: error.message,
             });
             channel.ack(msg);
-            console.error(`${tag} ✗ NO RECUPERABLE -> DLQ: ${error.message}`);
+            console.error(`${tag} ✗ NO RECUPERABLE -> ${queue.dlq.name}: ${error.message}`);
           } else if (retryCount < RETRY_POLICY.maxRetries) {
             // (2)
             const delayMs = RETRY_POLICY.delaysMs[retryCount];
@@ -80,12 +83,12 @@ export async function registerListener(channel, queueName, handler) {
           } else {
             // (3)
             channel.nack(msg, false, false);
-            console.error(`${tag} ✗ NACK tras ${retryCount} reintentos -> DLQ: ${error.message}`);
+            console.error(`${tag} ✗ NACK tras ${retryCount} reintentos -> ${queue.dlq.name}: ${error.message}`);
           }
         } catch (routingError) {
           // No se pudo republicar (broker caído): NACK sin requeue manda el
           // mensaje a la DLQ por la configuración de la cola; no se pierde.
-          console.error(`${tag} No se pudo enrutar el fallo (${routingError.message}). NACK -> DLQ`);
+          console.error(`${tag} No se pudo enrutar el fallo (${routingError.message}). NACK -> ${queue.dlq.name}`);
           try {
             channel.nack(msg, false, false);
           } catch {

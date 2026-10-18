@@ -1,8 +1,8 @@
-import { HEADERS, QUEUES } from "../config/messaging.js";
+import { HEADERS, WORK_QUEUES } from "../config/messaging.js";
 import * as DlqService from "../services/dlqService.js";
 
-// Dominio: AUDITORÍA DE FALLOS. Escucha pedidos.dlq, registra en el log por
-// qué murió cada mensaje y lo guarda en Supabase (panel DLQ del front).
+// Dominio: FALLOS. Escucha las 3 DLQ (una por cola de trabajo), registra en
+// el log por qué murió cada mensaje y lo guarda en Supabase (panel DLQ).
 // A diferencia de los otros consumidores SÍ hace ACK al terminar (la guía
 // 2.2.3 no lo hacía y el consumidor quedaba trabado tras el primer mensaje).
 
@@ -11,14 +11,13 @@ const REINTENTO_PERSISTENCIA_MS = 5000;
 // Motivo según cómo llegó el mensaje al DLX:
 //  - x-death (lo agrega RabbitMQ): rejected (NACK), expired (TTL), maxlen
 //  - x-dead-reason (lo agrega el listener): no-recuperable
-//  - ninguno: llegó por el alternate-exchange => evento sin cola destino
-function describirMuerte(msg) {
+function describirMuerte(msg, colaOrigen) {
   const headers = msg.properties.headers ?? {};
   const death = Array.isArray(headers["x-death"]) ? headers["x-death"][0] : null;
 
   return {
-    motivo: headers[HEADERS.DEAD_REASON] ?? death?.reason ?? "unrouted",
-    colaOrigen: headers[HEADERS.ORIGINAL_QUEUE] ?? death?.queue ?? null,
+    motivo: headers[HEADERS.DEAD_REASON] ?? death?.reason ?? "desconocido",
+    colaOrigen: headers[HEADERS.ORIGINAL_QUEUE] ?? death?.queue ?? colaOrigen,
     intentos: Number(headers[HEADERS.RETRY_COUNT] ?? 0),
     error: headers[HEADERS.LAST_ERROR] ?? null,
   };
@@ -32,19 +31,19 @@ function leerPayload(msg) {
   }
 }
 
-export function registerDlqConsumer(channel) {
+function consumeDlq(channel, queue) {
   return channel
     .consume(
-      QUEUES.DLQ.name,
+      queue.dlq.name,
       async (msg) => {
         if (!msg) return;
 
         const payload = leerPayload(msg);
-        const muerte = describirMuerte(msg);
+        const muerte = describirMuerte(msg, queue.name);
         const tipo = msg.properties.type ?? payload.tipo ?? msg.fields.routingKey;
 
         console.error(
-          `[DLQ] ☠ Mensaje en cuarentena | evento=${msg.properties.messageId ?? "?"} tipo=${tipo} ` +
+          `[DLQ ${queue.dlq.name}] ☠ Mensaje en cuarentena | evento=${msg.properties.messageId ?? "?"} tipo=${tipo} ` +
             `cola=${muerte.colaOrigen} motivo=${muerte.motivo} intentos=${muerte.intentos} ` +
             `error=${muerte.error ?? "-"}`,
         );
@@ -72,5 +71,11 @@ export function registerDlqConsumer(channel) {
       },
       { noAck: false },
     )
-    .then(() => console.log(`[CONSUMIDOR] Escuchando '${QUEUES.DLQ.name}'`));
+    .then(() => console.log(`[CONSUMIDOR] Escuchando '${queue.dlq.name}'`));
+}
+
+export async function registerDlqConsumers(channel) {
+  for (const queue of WORK_QUEUES) {
+    await consumeDlq(channel, queue);
+  }
 }

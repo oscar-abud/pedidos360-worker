@@ -3,33 +3,34 @@
 // colas, routing keys, headers y políticas viven aquí; el resto del código
 // solo importa estas constantes.
 //
-// Rutas de mensajería:
+// Rutas de mensajería (3 colas de trabajo, cada una con su DLQ):
 //
-//   pedidos.events (topic) ──pedido.creado──────────▶ pedidos.notificaciones.queue
-//                          ──pedido.estado.*────────▶ pedidos.notificaciones.queue
-//                          ──usuario.creado─────────▶ pedidos.notificaciones.queue
-//                          ──pedido.creado──────────▶ pedidos.tickets.queue
-//                          (sin destino: alternate-exchange ▶ pedidos.dlx)
+//   pedidos.events (topic) ──pedido.creado / pedido.estado.* / usuario.creado──▶ pedidos.notificaciones.queue
+//                          ──pedido.creado──────────────────────────────────────▶ pedidos.tickets.queue
+//                          ──# (todos los eventos)──────────────────────────────▶ pedidos.auditoria.queue
 //
 //   Reintento:  cola de trabajo ──(falla recuperable)──▶ pedidos.retry (direct)
 //               ──"1000"/"2000"/"4000"──▶ pedidos.retry.{ms}ms (TTL = espera)
 //               ──expira──▶ pedidos.retry.return (headers: pedidos-original-queue)
 //               ──▶ vuelve SOLO a la cola que falló
 //
-//   DLQ:        cola de trabajo ──nack / TTL / maxlen──▶ pedidos.dlx (fanout)
-//               ──▶ pedidos.dlq (retención 24 h) ──▶ consumidor DLQ (log + Supabase)
-
-const DLX_NAME = process.env.RABBITMQ_DLX_EXCHANGE ?? "pedidos.dlx";
+//   DLQ:        cola de trabajo ──nack / TTL / maxlen──▶ pedidos.dlx (direct)
+//               ──"notificaciones"──▶ pedidos.notificaciones.dlq
+//               ──"tickets"─────────▶ pedidos.tickets.dlq
+//               ──"auditoria"───────▶ pedidos.auditoria.dlq   ──▶ consumidor DLQ (log + Supabase)
+//
+// Clúster de 2 nodos: colas de trabajo y DLQs son "quorum" (replicadas en
+// ambos nodos). Las colas de espera de reintento son "classic" (efímeras).
 
 export const EXCHANGES = {
   EVENTS: {
     name: process.env.RABBITMQ_EVENTS_EXCHANGE ?? "pedidos.events",
     type: "topic",
-    options: { durable: true, alternateExchange: DLX_NAME },
+    options: { durable: true },
   },
   DLX: {
-    name: DLX_NAME,
-    type: "fanout",
+    name: process.env.RABBITMQ_DLX_EXCHANGE ?? "pedidos.dlx",
+    type: "direct",
     options: { durable: true },
   },
   RETRY: {
@@ -48,6 +49,7 @@ export const ROUTING_KEYS = {
   PEDIDO_CREADO: "pedido.creado",
   PEDIDO_ESTADO_ANY: "pedido.estado.*",
   USUARIO_CREADO: "usuario.creado",
+  ALL: "#",
 };
 
 export const HEADERS = {
@@ -73,31 +75,48 @@ export const CONSUMER = {
   prefetch: 1,
 };
 
-// Argumentos comunes de las colas de trabajo: si un mensaje se rechaza,
-// expira (TTL) o la cola se llena (max-length), RabbitMQ lo manda al DLX.
-const workQueueArguments = {
-  "x-dead-letter-exchange": DLX_NAME,
-  "x-message-ttl": Number(process.env.WORK_QUEUE_TTL_MS) || 600000, // 10 min
-  "x-max-length": 1000,
-};
+const WORK_QUEUE_TTL_MS = Number(process.env.WORK_QUEUE_TTL_MS) || 600000; // 10 min
+const DLQ_RETENTION_MS = 86400000; // 24 h
+
+// Cola de trabajo + su DLQ. Si un mensaje se rechaza (NACK), expira (TTL) o
+// la cola se llena (max-length), RabbitMQ lo manda al DLX con la routing key
+// de la cola, y el DLX lo deja en SU DLQ.
+function workQueue(name, dlqKey, bindings) {
+  return {
+    name,
+    bindings,
+    options: {
+      durable: true,
+      arguments: {
+        "x-queue-type": "quorum",
+        "x-dead-letter-exchange": EXCHANGES.DLX.name,
+        "x-dead-letter-routing-key": dlqKey,
+        "x-message-ttl": WORK_QUEUE_TTL_MS,
+        "x-max-length": 1000,
+      },
+    },
+    dlq: {
+      name: name.replace(/\.queue$/, ".dlq"),
+      routingKey: dlqKey,
+      options: {
+        durable: true,
+        arguments: { "x-queue-type": "quorum", "x-message-ttl": DLQ_RETENTION_MS },
+      },
+    },
+  };
+}
 
 export const QUEUES = {
-  NOTIFICACIONES: {
-    name: "pedidos.notificaciones.queue",
-    options: { durable: true, arguments: workQueueArguments },
-    bindings: [ROUTING_KEYS.PEDIDO_CREADO, ROUTING_KEYS.PEDIDO_ESTADO_ANY, ROUTING_KEYS.USUARIO_CREADO],
-  },
-  TICKETS: {
-    name: "pedidos.tickets.queue",
-    options: { durable: true, arguments: workQueueArguments },
-    bindings: [ROUTING_KEYS.PEDIDO_CREADO],
-  },
-  DLQ: {
-    name: "pedidos.dlq",
-    // Retención: los mensajes muertos se conservan 24 h para auditoría.
-    options: { durable: true, arguments: { "x-message-ttl": 86400000 } },
-  },
+  NOTIFICACIONES: workQueue("pedidos.notificaciones.queue", "notificaciones", [
+    ROUTING_KEYS.PEDIDO_CREADO,
+    ROUTING_KEYS.PEDIDO_ESTADO_ANY,
+    ROUTING_KEYS.USUARIO_CREADO,
+  ]),
+  TICKETS: workQueue("pedidos.tickets.queue", "tickets", [ROUTING_KEYS.PEDIDO_CREADO]),
+  AUDITORIA: workQueue("pedidos.auditoria.queue", "auditoria", [ROUTING_KEYS.ALL]),
 };
+
+export const WORK_QUEUES = [QUEUES.NOTIFICACIONES, QUEUES.TICKETS, QUEUES.AUDITORIA];
 
 // Una cola de espera por cada nivel de backoff. No tienen consumidores: el
 // mensaje espera su TTL y al expirar vuelve por pedidos.retry.return.

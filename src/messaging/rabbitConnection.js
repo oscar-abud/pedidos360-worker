@@ -12,12 +12,21 @@ let closing = false;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// RABBITMQ_URL puede traer varios nodos del clúster separados por coma
+// (amqp://u:p@host:5672,amqp://u:p@host:5673): si uno no responde se prueba
+// el siguiente, así el servicio sigue funcionando si se cae un nodo.
+const urls = env.rabbitmqUrl.split(",").map((url) => url.trim()).filter(Boolean);
+const safeHost = (url) => url.replace(/\/\/[^@]*@/, "//***@");
+
 async function openConnection() {
   for (let attempt = 1; attempt <= CONNECTION.maxRetries; attempt++) {
+    const url = urls[(attempt - 1) % urls.length];
     try {
-      return await amqp.connect(env.rabbitmqUrl);
+      const conn = await amqp.connect(url);
+      console.log(`[RABBITMQ] Conectado a ${safeHost(url)}`);
+      return conn;
     } catch (error) {
-      console.warn(`[RABBITMQ] Intento ${attempt}/${CONNECTION.maxRetries} fallido (${error.message}).`);
+      console.warn(`[RABBITMQ] Intento ${attempt}/${CONNECTION.maxRetries} a ${safeHost(url)} fallido (${error.message}).`);
       if (attempt === CONNECTION.maxRetries) throw error;
       await sleep(CONNECTION.retryDelayMs);
     }
