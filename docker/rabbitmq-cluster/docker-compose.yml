@@ -1,0 +1,54 @@
+# Clúster RabbitMQ de 2 nodos para Pedidos360 (se levanta en AWS EC2).
+#
+#   docker compose up -d        -> levanta rabbit1 + rabbit2 y forman el clúster
+#   docker compose ps           -> ambos deben quedar "healthy"
+#   Management UI: http://<IP>:15672  -> Overview > Nodes muestra los 2 nodos
+#
+# Los dos nodos arrancan a la vez, se descubren entre sí por "classic_config"
+# (rabbitmq.conf) y, como comparten el mismo Erlang cookie, uno se une al otro
+# formando un solo clúster.
+
+x-rabbitmq-node: &rabbitmq-node
+  image: rabbitmq:4.2-management
+  restart: unless-stopped
+  environment:
+    RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    # Mismo cookie en ambos nodos = pueden formar clúster.
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE}
+    RABBITMQ_CTL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE}
+  # La EC2 de la capa gratuita tiene 1 GB: se limita cada nodo (ver también
+  # vm_memory_high_watermark en rabbitmq.conf).
+  mem_limit: 450m
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 40s
+
+services:
+  rabbit1:
+    <<: *rabbitmq-node
+    hostname: rabbit1
+    container_name: pedidos360-rabbit1
+    ports:
+      - "5672:5672"   # AMQP nodo 1
+      - "15672:15672" # Management UI + API HTTP (ve todo el clúster)
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-pedidos360.conf:ro
+      - rabbit1_data:/var/lib/rabbitmq
+
+  rabbit2:
+    <<: *rabbitmq-node
+    hostname: rabbit2
+    container_name: pedidos360-rabbit2
+    ports:
+      - "5673:5672"   # AMQP nodo 2
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-pedidos360.conf:ro
+      - rabbit2_data:/var/lib/rabbitmq
+
+volumes:
+  rabbit1_data:
+  rabbit2_data:
