@@ -1,0 +1,168 @@
+# Clúster Kafka de Pedidos360: Zookeeper + 3 brokers + Kafka-UI (se levanta en
+# una EC2 propia, SEPARADA de la del clúster RabbitMQ).
+#
+#   cp .env.example .env        -> completar KAFKA_EXTERNAL_HOST con la IP pública
+#   docker compose up -d        -> levanta zookeeper + kafka1..3 + kafka-ui
+#   docker compose ps           -> los 5 deben quedar "healthy"
+#   Kafka-UI: http://<IP>:8080  -> Brokers muestra los 3 nodos y su controller
+#
+# Por qué Zookeeper y no KRaft: la pauta de la EP5 pide explícitamente "una
+# arquitectura Kafka con Zookeeper y brokers". Confluent Platform 8.x ya solo
+# admite KRaft, por eso se fija la serie 7.9.x, la última con soporte Zookeeper.
+#
+# Cada broker publica DOS listeners:
+#   INTERNAL (kafkaN:29092) -> tráfico entre brokers y con Kafka-UI, por la red
+#                              interna de Docker.
+#   EXTERNAL (IP:909X)      -> clientes fuera de Docker (back, worker, admin).
+# Un cliente Kafka primero pide metadata y luego se conecta a la dirección
+# ANUNCIADA, así que EXTERNAL debe anunciar la IP pública, no el hostname.
+
+x-kafka-env: &kafka-env
+  KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+  # Réplicas: con 3 brokers y RF 3, el clúster tolera la caída de 1 nodo.
+  # min.insync.replicas=2 + acks=all en el productor = ninguna escritura
+  # confirmada se pierde si un broker se cae.
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_NUM_PARTITIONS: 3
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+  # Los tópicos se crean explícitamente (pnpm topics:bootstrap en
+  # pedidos360-kafka-admin) con sus particiones, retención y cleanup policy.
+  # Si se autocrearan, nacerían con los valores por defecto del broker.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+  # Un rebalanceo espera 3s por si llegan más consumidores, así levantar un
+  # segundo worker no dispara dos rebalanceos seguidos.
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+
+  KAFKA_LOG_RETENTION_HOURS: 168
+  KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+
+x-kafka-broker: &kafka-broker
+  image: confluentinc/cp-kafka:7.9.11
+  restart: unless-stopped
+  depends_on:
+    zookeeper:
+      condition: service_healthy
+  mem_limit: 900m
+  healthcheck:
+    test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 45s
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.9.11
+    hostname: zookeeper
+    container_name: pedidos360-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 10
+      ZOOKEEPER_SYNC_LIMIT: 5
+      # Desde ZooKeeper 3.5 los comandos de 4 letras vienen bloqueados y el
+      # healthcheck (ruok -> imok) fallaría siempre, dejando a los brokers
+      # esperando para siempre. La imagen de Confluent no traduce la variable
+      # ZOOKEEPER_4LW_COMMANDS_WHITELIST (su nombre empieza con dígito), así
+      # que la propiedad se pasa directamente a la JVM.
+      KAFKA_OPTS: -Dzookeeper.4lw.commands.whitelist=ruok,srvr,stat
+      ZOOKEEPER_HEAP_OPTS: -Xms128m -Xmx256m
+    mem_limit: 400m
+    # Solo se publica para diagnóstico; en el Security Group de AWS este
+    # puerto NO debe abrirse a internet.
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  kafka1:
+    <<: *kafka-broker
+    hostname: kafka1
+    container_name: pedidos360-kafka1
+    ports:
+      - "9092:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 1
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:29092,EXTERNAL://${KAFKA_EXTERNAL_HOST}:9092
+    volumes:
+      - kafka1_data:/var/lib/kafka/data
+
+  kafka2:
+    <<: *kafka-broker
+    hostname: kafka2
+    container_name: pedidos360-kafka2
+    ports:
+      - "9094:9094"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 2
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:29092,EXTERNAL://${KAFKA_EXTERNAL_HOST}:9094
+    volumes:
+      - kafka2_data:/var/lib/kafka/data
+
+  kafka3:
+    <<: *kafka-broker
+    hostname: kafka3
+    container_name: pedidos360-kafka3
+    ports:
+      - "9096:9096"
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 3
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9096
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:29092,EXTERNAL://${KAFKA_EXTERNAL_HOST}:9096
+    volumes:
+      - kafka3_data:/var/lib/kafka/data
+
+  # Kafka-UI: administración visual de brokers, tópicos y consumer groups
+  # (lo exige el encargo). Habla con los brokers por la red interna.
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.1
+    hostname: kafka-ui
+    container_name: pedidos360-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: pedidos360
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:29092,kafka2:29092,kafka3:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      DYNAMIC_CONFIG_ENABLED: "true"
+      # Login obligatorio: la UI permite borrar tópicos, no se deja abierta.
+      AUTH_TYPE: LOGIN_FORM
+      SPRING_SECURITY_USER_NAME: ${KAFKA_UI_USER}
+      SPRING_SECURITY_USER_PASSWORD: ${KAFKA_UI_PASSWORD}
+    mem_limit: 600m
+
+volumes:
+  zookeeper_data:
+  zookeeper_log:
+  kafka1_data:
+  kafka2_data:
+  kafka3_data:
